@@ -264,27 +264,33 @@ def momentum_spike(oi):
 
 
 def confidence_score(rsi, prev_rsi, ls, oi, signal):
-    """
-    0–10 score based on how many indicators align with the signal.
-    Only trades with score >= 6 are sent.
-    """
     score = 0
 
     if signal == "LONG":
         if rsi < 40:          score += 2
-        if prev_rsi < rsi:    score += 1   # RSI turning up
-        if ls < 1.0:          score += 2   # short-heavy market
-        if oi > 0.1:          score += 2   # new money entering
-        if funding < -0.0001: score += 1   # shorts paying
-        if rsi < 32:          score += 2   # oversold bonus
+        if prev_rsi < rsi:    score += 1
+        if ls < 1.0:          score += 2
+        if funding < -0.0001: score += 1
+        if rsi < 32:          score += 2
 
     elif signal == "SHORT":
         if rsi > 60:          score += 2
-        if prev_rsi > rsi:    score += 1   # RSI turning down
-        if ls > 1.5:          score += 2   # long-heavy market
-        if oi > 0.1:          score += 2   # new money entering
-        if funding > 0.0001:  score += 1   # longs paying
-        if rsi > 68:          score += 2   # overbought bonus
+        if prev_rsi > rsi:    score += 1
+        if ls > 1.5:          score += 2
+        if funding > 0.0001:  score += 1
+        if rsi > 68:          score += 2
+
+    # Momentum tiers — OI size matters
+    if abs(oi) > 1.0:
+        score += 3
+    elif abs(oi) > 0.5:
+        score += 2
+    elif abs(oi) > 0.2:
+        score += 1
+
+    # Liquidity sweep bonus — highest quality SMC setup
+    if signal != "NEUTRAL":
+        score += 2
 
     return min(score, 10)
 
