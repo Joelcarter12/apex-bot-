@@ -1,8 +1,8 @@
 """
-APEX BOT — ELITE SNIPER v2
+APEX BOT — ELITE SNIPER FINAL
 Smart Money + Liquidity Sweeps + Judas Traps + Sessions
-+ Pre-Signal Warnings + Trap Pressure + Confidence Score
 Data: CoinGecko + OKX. Zero cost. 24/7 on Render.
+SILENT MODE: Only score 6+ signals fire to Telegram.
 """
 
 import os
@@ -19,7 +19,6 @@ OKX  = "https://www.okx.com/api/v5"
 INST = "BTC-USDT-SWAP"
 
 keep_alive()
-
 
 # ─── DATA FETCHERS ───────────────────────────
 
@@ -185,100 +184,24 @@ def momentum_ok(oi):
     return abs(oi) > 0.1
 
 
-# ─── NEW: INTELLIGENCE LAYER ─────────────────
+# ─── CONFIDENCE SCORE ────────────────────────
 
-def pre_signal(rsi, ls):
-    """
-    Early warning system — fires BEFORE a full signal forms.
-    Alerts you to building conditions so you're ready.
-    """
-    warnings = []
-
-    if rsi > 68:
-        warnings.append(f"RSI {rsi} approaching overbought — watch for SHORT setup")
-    elif rsi < 32:
-        warnings.append(f"RSI {rsi} approaching oversold — watch for LONG setup")
-
-    if ls > 2.0:
-        warnings.append(f"L/S {ls} — extreme long crowding, flush risk building")
-    elif ls < 0.6:
-        warnings.append(f"L/S {ls} — extreme short crowding, squeeze risk building")
-
-    if rsi > 65 and ls > 1.8:
-        warnings.append("RSI + L/S combo — SHORT trap conditions developing")
-
-    if rsi < 35 and ls < 0.8:
-        warnings.append("RSI + L/S combo — LONG trap conditions developing")
-
-    return " | ".join(warnings) if warnings else None
-
-
-def trap_pressure(ls, funding):
-    """
-    Measures how much pressure is building for a squeeze or flush.
-    High pressure = smart money has more fuel to run stops.
-    """
-    pressure_score = 0
-    direction      = None
-    notes          = []
-
-    # Long-side pressure (flush risk)
-    if ls > 1.8:
-        pressure_score += 1
-        notes.append(f"L/S {ls} crowded long")
-    if funding > 0.0001:
-        pressure_score += 1
-        notes.append(f"Funding {round(funding,5)} longs paying")
-
-    # Short-side pressure (squeeze risk)
-    if ls < 0.7:
-        pressure_score += 1
-        notes.append(f"L/S {ls} crowded short")
-    if funding < -0.0001:
-        pressure_score += 1
-        notes.append(f"Funding {round(funding,5)} shorts paying")
-
-    if pressure_score == 0:
-        return None
-
-    if ls > 1.0:
-        direction = "SHORT PRESSURE"
-        emoji     = "🔴"
-    else:
-        direction = "LONG PRESSURE"
-        emoji     = "🟢"
-
-    label = "LOW" if pressure_score == 1 else "MEDIUM" if pressure_score == 2 else "HIGH"
-    return f"{emoji} {direction} [{label}]: {' + '.join(notes)}"
-
-
-def momentum_spike(oi):
-    """
-    Detects unusual OI growth that signals a move is loading.
-    """
-    if oi > 1.0:
-        return f"🚀 OI SPIKE +{oi}% — big move loading, stay alert"
-    if oi < -1.0:
-        return f"💨 OI DUMP {oi}% — positions unwinding fast"
-    return None
-
-
-def confidence_score(rsi, prev_rsi, ls, oi, signal):
+def confidence_score(rsi, prev_rsi, ls, oi, signal, funding):
     score = 0
 
     if signal == "LONG":
-        if rsi < 40:          score += 2
-        if prev_rsi < rsi:    score += 1
-        if ls < 1.0:          score += 2
-        if funding < -0.0001: score += 1
-        if rsi < 32:          score += 2
+        if rsi < 40:           score += 2
+        if prev_rsi < rsi:     score += 1
+        if ls < 1.0:           score += 2
+        if funding < -0.0001:  score += 1
+        if rsi < 32:           score += 2
 
     elif signal == "SHORT":
-        if rsi > 60:          score += 2
-        if prev_rsi > rsi:    score += 1
-        if ls > 1.5:          score += 2
-        if funding > 0.0001:  score += 1
-        if rsi > 68:          score += 2
+        if rsi > 60:           score += 2
+        if prev_rsi > rsi:     score += 1
+        if ls > 1.5:           score += 2
+        if funding > 0.0001:   score += 1
+        if rsi > 68:           score += 2
 
     # Momentum tiers — OI size matters
     if abs(oi) > 1.0:
@@ -324,7 +247,7 @@ def dynamic_levels(signal, candles, price):
 def apex_sniper(price, rsi, prev_rsi, funding, ls, oi, candles):
     session_ok, session_name = session_filter()
     if not session_ok:
-        return "NEUTRAL", f"No trade — {session_name}", session_name
+        return "NEUTRAL", f"Dead zone — {session_name}", session_name
     if not momentum_ok(oi):
         return "NEUTRAL", f"No momentum (OI {oi}%)", session_name
 
@@ -358,6 +281,8 @@ def send_telegram(msg):
         )
         if r.status_code == 200:
             print("[✓] Telegram sent.")
+        else:
+            print(f"[WARN] Telegram: {r.text}")
     except Exception as e:
         print(f"[ERROR] Telegram: {e}")
 
@@ -365,13 +290,12 @@ def send_telegram(msg):
 # ─── MAIN CYCLE ──────────────────────────────
 
 prev_rsi = None
-funding  = 0   # make funding accessible to confidence_score
 
 def run():
-    global prev_rsi, funding
+    global prev_rsi
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     print(f"\n{'='*48}")
-    print(f"  APEX ELITE v2 — {now}")
+    print(f"  APEX ELITE — {now}")
     print(f"{'='*48}")
 
     price        = get_price()
@@ -384,65 +308,30 @@ def run():
 
     print(f"BTC: ${price:,.2f} | RSI: {rsi} | L/S: {ls} | OI: {oi}% | F&G: {fg}")
 
-    # ── Intelligence layer (runs every cycle, no session filter) ──
-    warning  = pre_signal(rsi, ls)
-    pressure = trap_pressure(ls, funding)
-    spike    = momentum_spike(oi)
-
-    if warning:
-        print(f"[PRE] {warning}")
-        send_telegram(
-            f"⚠️ *APEX PRE-SIGNAL* `{now}`\n\n"
-            f"{warning}\n\n"
-            f"*RSI:* {rsi} | *L/S:* {ls}"
-        )
-
-    if pressure:
-        print(f"[PRESSURE] {pressure}")
-        send_telegram(
-            f"🧲 *APEX TRAP PRESSURE* `{now}`\n\n"
-            f"{pressure}\n\n"
-            f"*Funding:* {round(funding,5)} | *L/S:* {ls}"
-        )
-
-    if spike:
-        print(f"[SPIKE] {spike}")
-        send_telegram(
-            f"📊 *APEX MOMENTUM SPIKE* `{now}`\n\n"
-            f"{spike}"
-        )
-
-    # ── First run — just store RSI ──
+    # First run — store RSI, stay silent
     if prev_rsi is None:
         prev_rsi = rsi
-        print("[i] First run — RSI stored.")
+        print("[i] First run — RSI stored. Monitoring...")
         return
 
-    # ── Main signal logic ──
     signal, reason, session = apex_sniper(price, rsi, prev_rsi, funding, ls, oi, candles)
-    score = confidence_score(rsi, prev_rsi, ls, oi, signal)
+    score = confidence_score(rsi, prev_rsi, ls, oi, signal, funding)
 
+    print(f"Signal: {signal} | Score: {score}/10 | {reason}")
+
+    # SILENT — no Telegram unless score 6+
     if signal == "NEUTRAL" or score < 6:
-        print(f"No trade | Score: {score}/10 | {reason}")
-        send_telegram(
-            f"⏸ *APEX — NO TRADE* `{now}`\n\n"
-            f"_{reason}_\n"
-            f"*Score:* {score}/10\n\n"
-            f"*BTC:* ${price:,.2f} | *RSI:* {rsi}\n"
-            f"*Funding:* {round(funding,5)} | *OI:* {oi}%\n"
-            f"*L/S:* {ls} | *F&G:* {fg} ({fg_label})\n"
-            f"*Session:* {session}"
-        )
         prev_rsi = rsi
         return
 
+    # RR check
     sl, tp, rr = dynamic_levels(signal, candles, price)
-
-    if rr and rr < 1.5:
+    if not sl or rr < 1.5:
         print(f"[SKIP] RR {rr} too low")
         prev_rsi = rsi
         return
 
+    # Fire signal
     direction = "📈" if signal == "LONG" else "📉"
     bar = "█" * score + "░" * (10 - score)
 
@@ -470,7 +359,8 @@ def run():
 
 def main():
     print("\n" + "█"*48)
-    print("  APEX ELITE v2 — STARTING")
+    print("  APEX ELITE — SILENT SNIPER MODE")
+    print("  Only 6/10+ signals fire to Telegram")
     print("█"*48 + "\n")
 
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
@@ -479,7 +369,7 @@ def main():
 
     run()
     schedule.every(5).minutes.do(run)
-    print("[✓] Scheduler active — every 5 minutes.\n")
+    print("[✓] Monitoring silently — every 5 minutes.\n")
 
     while True:
         schedule.run_pending()
@@ -488,4 +378,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-        
+    
