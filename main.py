@@ -208,8 +208,8 @@ def session_filter():
 
 
 def momentum_ok(oi):
-    """Require at least 0.5% OI change to confirm momentum."""
-    return abs(oi) > 0.5
+    """Require at least 0.1% OI change to confirm momentum."""
+    return abs(oi) > 0.1
 
 
 # ─── DYNAMIC SL/TP ───────────────────────────
