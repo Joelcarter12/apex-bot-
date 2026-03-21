@@ -1,7 +1,8 @@
 """
-APEX BOT — ELITE SNIPER FINAL
+APEX BOT — ELITE SNIPER | MULTI-PAIR + HTF TREND FILTER
+Pairs: BTC, ETH, SOL, XRP, BNB
 Smart Money + Liquidity Sweeps + Judas Traps + Sessions
-Data: CoinGecko + OKX. Zero cost. 24/7 on Render.
+HTF Filter: 1H EMA20 + 4H EMA20 — signal must align with at least one
 SILENT MODE: Only score 6+ signals fire to Telegram.
 """
 
@@ -15,34 +16,35 @@ from keep_alive import keep_alive
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-OKX  = "https://www.okx.com/api/v5"
-INST = "BTC-USDT-SWAP"
+OKX = "https://www.okx.com/api/v5"
+
+PAIRS = [
+    {"symbol": "BTC", "inst": "BTC-USDT-SWAP", "ccy": "BTC"},
+    {"symbol": "ETH", "inst": "ETH-USDT-SWAP", "ccy": "ETH"},
+    {"symbol": "SOL", "inst": "SOL-USDT-SWAP", "ccy": "SOL"},
+    {"symbol": "XRP", "inst": "XRP-USDT-SWAP", "ccy": "XRP"},
+    {"symbol": "BNB", "inst": "BNB-USDT-SWAP", "ccy": "BNB"},
+]
+
+prev_rsi_map = {p["symbol"]: None for p in PAIRS}
 
 keep_alive()
 
 # ─── DATA FETCHERS ───────────────────────────
 
-def get_price():
+def get_price(inst):
     try:
-        r = requests.get(
-            "https://api.coingecko.com/api/v3/simple/price",
-            params={"ids": "bitcoin", "vs_currencies": "usd"},
-            timeout=10
-        )
-        return float(r.json()["bitcoin"]["usd"])
+        r = requests.get(f"{OKX}/market/ticker", params={"instId": inst}, timeout=10)
+        return float(r.json()["data"][0]["last"])
     except:
-        try:
-            r = requests.get(f"{OKX}/market/ticker", params={"instId": INST}, timeout=10)
-            return float(r.json()["data"][0]["last"])
-        except:
-            return 0
+        return 0
 
 
-def get_candles(bar="5m", limit=50):
+def get_candles(inst, bar="5m", limit=50):
     try:
         r = requests.get(
             f"{OKX}/market/candles",
-            params={"instId": INST, "bar": bar, "limit": str(limit)},
+            params={"instId": inst, "bar": bar, "limit": str(limit)},
             timeout=10
         )
         return list(reversed(r.json()["data"]))
@@ -50,9 +52,9 @@ def get_candles(bar="5m", limit=50):
         return []
 
 
-def get_rsi():
+def get_rsi(inst):
     try:
-        candles = get_candles(bar="15m", limit=100)
+        candles = get_candles(inst, bar="15m", limit=100)
         closes  = [float(c[4]) for c in candles]
         gains, losses = [], []
         for i in range(1, len(closes)):
@@ -61,59 +63,45 @@ def get_rsi():
         avg_gain = sum(gains[-14:]) / 14 if gains else 0
         avg_loss = sum(losses[-14:]) / 14 if losses else 1
         rs  = avg_gain / avg_loss if avg_loss else 0
-        rsi = round(100 - (100 / (1 + rs)), 2)
-        print(f"[✓] RSI: {rsi}")
-        return rsi
+        return round(100 - (100 / (1 + rs)), 2)
     except:
         return 50
 
 
-def get_funding():
+def get_funding(inst):
     try:
-        r = requests.get(
-            f"{OKX}/public/funding-rate",
-            params={"instId": INST},
-            timeout=10
-        )
-        rate = float(r.json()["data"][0]["fundingRate"])
-        print(f"[✓] Funding: {rate}")
-        return rate
+        r = requests.get(f"{OKX}/public/funding-rate", params={"instId": inst}, timeout=10)
+        return float(r.json()["data"][0]["fundingRate"])
     except:
         return 0
 
 
-def get_oi():
+def get_oi(ccy):
     try:
         r = requests.get(
             f"{OKX}/rubik/stat/contracts/open-interest-volume",
-            params={"ccy": "BTC", "period": "1H"},
+            params={"ccy": ccy, "period": "1H"},
             timeout=10
         )
         data = r.json().get("data", [])
         if len(data) >= 2:
             latest = float(data[-1][1])
             prev   = float(data[-2][1])
-            change = round(((latest - prev) / prev) * 100, 3) if prev else 0
-            print(f"[✓] OI: {change}%")
-            return change
+            return round(((latest - prev) / prev) * 100, 3) if prev else 0
         return 0
     except:
         return 0
 
 
-def get_ls():
+def get_ls(ccy):
     try:
         r = requests.get(
             f"{OKX}/rubik/stat/contracts/long-short-account-ratio",
-            params={"ccy": "BTC", "period": "1H"},
+            params={"ccy": ccy, "period": "1H"},
             timeout=10
         )
         data = r.json().get("data", [])
-        if data:
-            ratio = float(data[-1][1])
-            print(f"[✓] L/S: {round(ratio,3)}")
-            return round(ratio, 3)
-        return 1
+        return round(float(data[-1][1]), 3) if data else 1
     except:
         return 1
 
@@ -127,6 +115,56 @@ def get_fear_greed():
         return 50, "Neutral"
 
 
+# ─── HTF TREND FILTER ────────────────────────
+
+def calc_ema(closes, period):
+    if len(closes) < period:
+        return None
+    k   = 2 / (period + 1)
+    val = sum(closes[:period]) / period
+    for price in closes[period:]:
+        val = price * k + val * (1 - k)
+    return round(val, 6)
+
+
+def get_htf_trend(inst, price):
+    """
+    Returns (trend_1h, trend_4h, label)
+    BULL = price above EMA20, BEAR = price below EMA20
+    """
+    try:
+        candles_1h = get_candles(inst, bar="1H", limit=30)
+        closes_1h  = [float(c[4]) for c in candles_1h]
+        ema_1h     = calc_ema(closes_1h, 20)
+        trend_1h   = ("BULL" if price > ema_1h else "BEAR") if ema_1h else "NEUTRAL"
+    except:
+        trend_1h = "NEUTRAL"
+
+    try:
+        candles_4h = get_candles(inst, bar="4H", limit=30)
+        closes_4h  = [float(c[4]) for c in candles_4h]
+        ema_4h     = calc_ema(closes_4h, 20)
+        trend_4h   = ("BULL" if price > ema_4h else "BEAR") if ema_4h else "NEUTRAL"
+    except:
+        trend_4h = "NEUTRAL"
+
+    label = f"1H:{trend_1h} 4H:{trend_4h}"
+    return trend_1h, trend_4h, label
+
+
+def htf_allows(signal, trend_1h, trend_4h):
+    """
+    LONG needs at least one HTF bullish.
+    SHORT needs at least one HTF bearish.
+    Both against = hard block.
+    """
+    if signal == "LONG":
+        return trend_1h == "BULL" or trend_4h == "BULL"
+    if signal == "SHORT":
+        return trend_1h == "BEAR" or trend_4h == "BEAR"
+    return True
+
+
 # ─── SMART MONEY DETECTION ───────────────────
 
 def detect_liquidity_sweep(candles):
@@ -136,14 +174,9 @@ def detect_liquidity_sweep(candles):
         highs  = [float(c[2]) for c in candles]
         lows   = [float(c[3]) for c in candles]
         closes = [float(c[4]) for c in candles]
-        last_high  = highs[-1]
-        prev_high  = max(highs[-6:-1])
-        last_low   = lows[-1]
-        prev_low   = min(lows[-6:-1])
-        last_close = closes[-1]
-        if last_high > prev_high and last_close < prev_high:
+        if highs[-1] > max(highs[-6:-1]) and closes[-1] < max(highs[-6:-1]):
             return "SHORT", "Liquidity sweep above highs — trap confirmed"
-        if last_low < prev_low and last_close > prev_low:
+        if lows[-1] < min(lows[-6:-1]) and closes[-1] > min(lows[-6:-1]):
             return "LONG", "Liquidity sweep below lows — trap confirmed"
         return None, None
     except:
@@ -156,13 +189,10 @@ def detect_judas(candles):
             return None, None
         opens  = [float(c[1]) for c in candles]
         closes = [float(c[4]) for c in candles]
-        last_open  = opens[-1]
-        last_close = closes[-1]
-        prev_close = closes[-2]
-        move = (last_close - prev_close) / prev_close * 100
-        if move > 0.5 and last_close < last_open:
+        move = (closes[-1] - closes[-2]) / closes[-2] * 100
+        if move > 0.5 and closes[-1] < opens[-1]:
             return "SHORT", "Judas pump — bearish reversal candle"
-        if move < -0.5 and last_close > last_open:
+        if move < -0.5 and closes[-1] > opens[-1]:
             return "LONG", "Judas dump — bullish reversal candle"
         return None, None
     except:
@@ -186,7 +216,7 @@ def momentum_ok(oi):
 
 # ─── CONFIDENCE SCORE ────────────────────────
 
-def confidence_score(rsi, prev_rsi, ls, oi, signal, funding):
+def confidence_score(rsi, prev_rsi, ls, oi, signal, funding, trend_1h, trend_4h):
     score = 0
 
     if signal == "LONG":
@@ -195,6 +225,8 @@ def confidence_score(rsi, prev_rsi, ls, oi, signal, funding):
         if ls < 1.0:           score += 2
         if funding < -0.0001:  score += 1
         if rsi < 32:           score += 2
+        if trend_1h == "BULL": score += 1  # 1H confirmation
+        if trend_4h == "BULL": score += 2  # 4H carries more weight
 
     elif signal == "SHORT":
         if rsi > 60:           score += 2
@@ -202,18 +234,14 @@ def confidence_score(rsi, prev_rsi, ls, oi, signal, funding):
         if ls > 1.5:           score += 2
         if funding > 0.0001:   score += 1
         if rsi > 68:           score += 2
+        if trend_1h == "BEAR": score += 1
+        if trend_4h == "BEAR": score += 2
 
-    # Momentum tiers — OI size matters
-    if abs(oi) > 1.0:
-        score += 3
-    elif abs(oi) > 0.5:
-        score += 2
-    elif abs(oi) > 0.2:
-        score += 1
+    if abs(oi) > 1.0:   score += 3
+    elif abs(oi) > 0.5: score += 2
+    elif abs(oi) > 0.2: score += 1
 
-    # Liquidity sweep bonus — highest quality SMC setup
-    if signal != "NEUTRAL":
-        score += 2
+    if signal != "NEUTRAL": score += 1
 
     return min(score, 10)
 
@@ -224,14 +252,12 @@ def dynamic_levels(signal, candles, price):
     try:
         highs = [float(c[2]) for c in candles[-10:]]
         lows  = [float(c[3]) for c in candles[-10:]]
-        recent_high = max(highs)
-        recent_low  = min(lows)
         if signal == "LONG":
-            sl = round(recent_low  * 0.998, 2)
-            tp = round(recent_high * 1.002, 2)
+            sl = round(min(lows)  * 0.998, 4)
+            tp = round(max(highs) * 1.002, 4)
         elif signal == "SHORT":
-            sl = round(recent_high * 1.002, 2)
-            tp = round(recent_low  * 0.998, 2)
+            sl = round(max(highs) * 1.002, 4)
+            tp = round(min(lows)  * 0.998, 4)
         else:
             return None, None, 0
         sl_dist = abs(price - sl)
@@ -287,66 +313,68 @@ def send_telegram(msg):
         print(f"[ERROR] Telegram: {e}")
 
 
-# ─── MAIN CYCLE ──────────────────────────────
+# ─── PER-PAIR CYCLE ──────────────────────────
 
-prev_rsi = None
+def run_pair(pair, now, fg, fg_label):
+    symbol = pair["symbol"]
+    inst   = pair["inst"]
+    ccy    = pair["ccy"]
 
-def run():
-    global prev_rsi
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    print(f"\n{'='*48}")
-    print(f"  APEX ELITE — {now}")
-    print(f"{'='*48}")
+    price   = get_price(inst)
+    candles = get_candles(inst, bar="5m", limit=50)
+    rsi     = get_rsi(inst)
+    funding = get_funding(inst)
+    ls      = get_ls(ccy)
+    oi      = get_oi(ccy)
 
-    price        = get_price()
-    candles      = get_candles(bar="5m", limit=50)
-    rsi          = get_rsi()
-    funding      = get_funding()
-    ls           = get_ls()
-    oi           = get_oi()
-    fg, fg_label = get_fear_greed()
+    trend_1h, trend_4h, htf_label = get_htf_trend(inst, price)
 
-    print(f"BTC: ${price:,.2f} | RSI: {rsi} | L/S: {ls} | OI: {oi}% | F&G: {fg}")
+    print(f"{symbol}: ${price:,.4f} | RSI:{rsi} | L/S:{ls} | OI:{oi}% | {htf_label}")
 
-    # First run — store RSI, stay silent
+    prev_rsi = prev_rsi_map[symbol]
+
     if prev_rsi is None:
-        prev_rsi = rsi
-        print("[i] First run — RSI stored. Monitoring...")
+        prev_rsi_map[symbol] = rsi
+        print(f"  [i] First run — RSI stored.")
         return
 
     signal, reason, session = apex_sniper(price, rsi, prev_rsi, funding, ls, oi, candles)
-    score = confidence_score(rsi, prev_rsi, ls, oi, signal, funding)
 
-    print(f"Signal: {signal} | Score: {score}/10 | {reason}")
-
-    # SILENT — no Telegram unless score 6+
-    if signal == "NEUTRAL" or score < 6:
-        prev_rsi = rsi
+    # ── HTF GATE ─────────────────────────────
+    if signal != "NEUTRAL" and not htf_allows(signal, trend_1h, trend_4h):
+        print(f"  [BLOCKED] {signal} — HTF against signal ({htf_label})")
+        prev_rsi_map[symbol] = rsi
         return
 
-    # RR check
+    score = confidence_score(rsi, prev_rsi, ls, oi, signal, funding, trend_1h, trend_4h)
+    print(f"  → {signal} | Score:{score}/10 | {reason}")
+
+    if signal == "NEUTRAL" or score < 6:
+        prev_rsi_map[symbol] = rsi
+        return
+
     sl, tp, rr = dynamic_levels(signal, candles, price)
     if not sl or rr < 1.5:
-        print(f"[SKIP] RR {rr} too low")
-        prev_rsi = rsi
+        print(f"  [SKIP] RR {rr} too low")
+        prev_rsi_map[symbol] = rsi
         return
 
-    # Fire signal
     direction = "📈" if signal == "LONG" else "📉"
     bar = "█" * score + "░" * (10 - score)
 
     msg = (
-        f"🎯 *APEX ELITE — {signal}* `{now}`\n\n"
+        f"🎯 *APEX ELITE — {symbol} {signal}* `{now}`\n\n"
         f"*Reason:* {reason}\n"
-        f"*Session:* {session}\n\n"
-        f"*Entry:* ${price:,.2f}\n"
+        f"*Session:* {session}\n"
+        f"*Trend:* {htf_label}\n\n"
+        f"*Entry:* ${price:,.4f}\n"
         f"*TP:* ${tp:,}\n"
         f"*SL:* ${sl:,}\n"
         f"*R/R:* {rr}x {direction}\n\n"
         f"*Confidence:* {score}/10\n"
         f"`{bar}`\n\n"
         f"*RSI:* {prev_rsi} → {rsi}\n"
-        f"*Funding:* {round(funding,5)}\n"
+        f"*Funding:* {round(funding,6)}\n"
         f"*L/S:* {ls} | *OI:* {oi}%\n"
         f"*F&G:* {fg} — {fg_label}\n\n"
         f"⚠️ _Smart Money Active_"
@@ -354,12 +382,33 @@ def run():
 
     print(msg)
     send_telegram(msg)
-    prev_rsi = rsi
+    prev_rsi_map[symbol] = rsi
+
+
+# ─── MAIN CYCLE ──────────────────────────────
+
+def run():
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    print(f"\n{'='*48}")
+    print(f"  APEX ELITE MULTI — {now}")
+    print(f"{'='*48}")
+
+    fg, fg_label = get_fear_greed()
+    print(f"F&G: {fg} — {fg_label}\n")
+
+    for pair in PAIRS:
+        try:
+            run_pair(pair, now, fg, fg_label)
+        except Exception as e:
+            print(f"[ERROR] {pair['symbol']}: {e}")
+        time.sleep(2)
 
 
 def main():
     print("\n" + "█"*48)
-    print("  APEX ELITE — SILENT SNIPER MODE")
+    print("  APEX ELITE — MULTI-PAIR + HTF FILTER")
+    print("  Pairs: BTC | ETH | SOL | XRP | BNB")
+    print("  HTF: 1H EMA20 + 4H EMA20 confirmation")
     print("  Only 6/10+ signals fire to Telegram")
     print("█"*48 + "\n")
 
@@ -378,4 +427,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
+        
