@@ -1,16 +1,15 @@
 """
-APEX BOT — ELITE SNIPER FINAL
-Smart Money + Liquidity Sweeps + Judas Traps + Sessions
-Data: CoinGecko + OKX. Zero cost. 24/7 on Render.
-
-ALERT TIERS:
-  🔍 SCOUT     — Score 4–5  | Wide window | RR ≥ 1.2 | 0.5% SL/TP buffer
-  ⚡ PRE-ALERT — Score 5    | "Sniper forming — get ready"
-  🎯 SNIPER    — Score 6+   | Tight entry  | RR ≥ 1.5 | 0.2% SL/TP buffer
+APEX BOT — ELITE SNIPER | FINAL
+Pairs  : BTC, ETH, SOL, XRP, BNB
+Tiers  : 🎯 Sniper (5m/15m) | 📊 Swing 1H | 🏹 Swing 4H
+HTF    : EMA20 + EMA50 bias filter
+Storage: SQLite — survives session restarts
+Scan   : 5m → every 3 min | 1H → every 15 min | 4H → every 60 min
 """
 
 import os
 import time
+import sqlite3
 import requests
 import schedule
 from datetime import datetime, timezone
@@ -19,34 +18,86 @@ from keep_alive import keep_alive
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-OKX  = "https://www.okx.com/api/v5"
-INST = "BTC-USDT-SWAP"
+OKX = "https://www.okx.com/api/v5"
+DB  = "apex_signals.db"
+
+PAIRS = [
+    {"symbol": "BTC", "inst": "BTC-USDT-SWAP", "ccy": "BTC"},
+    {"symbol": "ETH", "inst": "ETH-USDT-SWAP", "ccy": "ETH"},
+    {"symbol": "SOL", "inst": "SOL-USDT-SWAP", "ccy": "SOL"},
+    {"symbol": "XRP", "inst": "XRP-USDT-SWAP", "ccy": "XRP"},
+    {"symbol": "BNB", "inst": "BNB-USDT-SWAP", "ccy": "BNB"},
+]
+
+# Per-pair RSI memory (still in memory — only needs one cycle to warm up)
+prev_rsi_map = {p["symbol"]: None for p in PAIRS}
 
 keep_alive()
 
+
+# ─── SQLITE STORAGE ──────────────────────────
+
+def init_db():
+    conn = sqlite3.connect(DB)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS sent_alerts (
+            id          TEXT PRIMARY KEY,
+            symbol      TEXT,
+            timeframe   TEXT,
+            signal      TEXT,
+            score       INTEGER,
+            created_at  TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
+    print("[✓] DB ready.")
+
+
+def alert_exists(alert_id):
+    conn = sqlite3.connect(DB)
+    row  = conn.execute("SELECT 1 FROM sent_alerts WHERE id=?", (alert_id,)).fetchone()
+    conn.close()
+    return row is not None
+
+
+def save_alert(alert_id, symbol, timeframe, signal, score):
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    conn = sqlite3.connect(DB)
+    conn.execute(
+        "INSERT OR IGNORE INTO sent_alerts VALUES (?,?,?,?,?,?)",
+        (alert_id, symbol, timeframe, signal, score, now)
+    )
+    conn.commit()
+    conn.close()
+
+
+def clear_old_alerts():
+    """Remove alerts older than 48 hours to keep DB lean."""
+    conn = sqlite3.connect(DB)
+    conn.execute("""
+        DELETE FROM sent_alerts
+        WHERE created_at < datetime('now', '-48 hours')
+    """)
+    conn.commit()
+    conn.close()
+
+
 # ─── DATA FETCHERS ───────────────────────────
 
-def get_price():
+def get_price(inst):
     try:
-        r = requests.get(
-            "https://api.coingecko.com/api/v3/simple/price",
-            params={"ids": "bitcoin", "vs_currencies": "usd"},
-            timeout=10
-        )
-        return float(r.json()["bitcoin"]["usd"])
+        r = requests.get(f"{OKX}/market/ticker", params={"instId": inst}, timeout=10)
+        return float(r.json()["data"][0]["last"])
     except:
-        try:
-            r = requests.get(f"{OKX}/market/ticker", params={"instId": INST}, timeout=10)
-            return float(r.json()["data"][0]["last"])
-        except:
-            return 0
+        return 0
 
 
-def get_candles(bar="5m", limit=50):
+def get_candles(inst, bar="5m", limit=50):
     try:
         r = requests.get(
             f"{OKX}/market/candles",
-            params={"instId": INST, "bar": bar, "limit": str(limit)},
+            params={"instId": inst, "bar": bar, "limit": str(limit)},
             timeout=10
         )
         return list(reversed(r.json()["data"]))
@@ -54,70 +105,55 @@ def get_candles(bar="5m", limit=50):
         return []
 
 
-def get_rsi():
+def get_rsi(candles):
     try:
-        candles = get_candles(bar="15m", limit=100)
-        closes  = [float(c[4]) for c in candles]
+        closes = [float(c[4]) for c in candles]
         gains, losses = [], []
         for i in range(1, len(closes)):
             diff = closes[i] - closes[i - 1]
             (gains if diff > 0 else losses).append(abs(diff))
         avg_gain = sum(gains[-14:]) / 14 if gains else 0
         avg_loss = sum(losses[-14:]) / 14 if losses else 1
-        rs  = avg_gain / avg_loss if avg_loss else 0
-        rsi = round(100 - (100 / (1 + rs)), 2)
-        print(f"[✓] RSI: {rsi}")
-        return rsi
+        rs = avg_gain / avg_loss if avg_loss else 0
+        return round(100 - (100 / (1 + rs)), 2)
     except:
         return 50
 
 
-def get_funding():
+def get_funding(inst):
     try:
-        r = requests.get(
-            f"{OKX}/public/funding-rate",
-            params={"instId": INST},
-            timeout=10
-        )
-        rate = float(r.json()["data"][0]["fundingRate"])
-        print(f"[✓] Funding: {rate}")
-        return rate
+        r = requests.get(f"{OKX}/public/funding-rate", params={"instId": inst}, timeout=10)
+        return float(r.json()["data"][0]["fundingRate"])
     except:
         return 0
 
 
-def get_oi():
+def get_oi(ccy):
     try:
         r = requests.get(
             f"{OKX}/rubik/stat/contracts/open-interest-volume",
-            params={"ccy": "BTC", "period": "1H"},
+            params={"ccy": ccy, "period": "1H"},
             timeout=10
         )
         data = r.json().get("data", [])
         if len(data) >= 2:
             latest = float(data[-1][1])
             prev   = float(data[-2][1])
-            change = round(((latest - prev) / prev) * 100, 3) if prev else 0
-            print(f"[✓] OI: {change}%")
-            return change
+            return round(((latest - prev) / prev) * 100, 3) if prev else 0
         return 0
     except:
         return 0
 
 
-def get_ls():
+def get_ls(ccy):
     try:
         r = requests.get(
             f"{OKX}/rubik/stat/contracts/long-short-account-ratio",
-            params={"ccy": "BTC", "period": "1H"},
+            params={"ccy": ccy, "period": "1H"},
             timeout=10
         )
         data = r.json().get("data", [])
-        if data:
-            ratio = float(data[-1][1])
-            print(f"[✓] L/S: {round(ratio,3)}")
-            return round(ratio, 3)
-        return 1
+        return round(float(data[-1][1]), 3) if data else 1
     except:
         return 1
 
@@ -131,7 +167,53 @@ def get_fear_greed():
         return 50, "Neutral"
 
 
-# ─── SMART MONEY DETECTION ───────────────────
+# ─── HTF BIAS (EMA20 + EMA50) ────────────────
+
+def calc_ema(closes, period):
+    if len(closes) < period:
+        return None
+    k   = 2 / (period + 1)
+    val = sum(closes[:period]) / period
+    for p in closes[period:]:
+        val = p * k + val * (1 - k)
+    return val
+
+
+def get_bias(inst, price, bar="1H"):
+    """
+    BULL  = price > EMA20 > EMA50
+    BEAR  = price < EMA20 < EMA50
+    NEUTRAL = mixed
+    """
+    try:
+        candles = get_candles(inst, bar=bar, limit=60)
+        closes  = [float(c[4]) for c in candles]
+        ema20   = calc_ema(closes, 20)
+        ema50   = calc_ema(closes, 50)
+        if not ema20 or not ema50:
+            return "NEUTRAL"
+        if price > ema20 > ema50:
+            return "BULL"
+        elif price < ema20 < ema50:
+            return "BEAR"
+        return "NEUTRAL"
+    except:
+        return "NEUTRAL"
+
+
+def bias_allows(signal, bias_1h, bias_4h):
+    """
+    Need at least one HTF aligned.
+    Both against = hard block.
+    """
+    if signal == "LONG":
+        return bias_1h == "BULL" or bias_4h == "BULL"
+    if signal == "SHORT":
+        return bias_1h == "BEAR" or bias_4h == "BEAR"
+    return True
+
+
+# ─── SMART MONEY DETECTORS ───────────────────
 
 def detect_liquidity_sweep(candles):
     try:
@@ -140,14 +222,9 @@ def detect_liquidity_sweep(candles):
         highs  = [float(c[2]) for c in candles]
         lows   = [float(c[3]) for c in candles]
         closes = [float(c[4]) for c in candles]
-        last_high  = highs[-1]
-        prev_high  = max(highs[-6:-1])
-        last_low   = lows[-1]
-        prev_low   = min(lows[-6:-1])
-        last_close = closes[-1]
-        if last_high > prev_high and last_close < prev_high:
+        if highs[-1] > max(highs[-6:-1]) and closes[-1] < max(highs[-6:-1]):
             return "SHORT", "Liquidity sweep above highs — trap confirmed"
-        if last_low < prev_low and last_close > prev_low:
+        if lows[-1] < min(lows[-6:-1]) and closes[-1] > min(lows[-6:-1]):
             return "LONG", "Liquidity sweep below lows — trap confirmed"
         return None, None
     except:
@@ -160,13 +237,10 @@ def detect_judas(candles):
             return None, None
         opens  = [float(c[1]) for c in candles]
         closes = [float(c[4]) for c in candles]
-        last_open  = opens[-1]
-        last_close = closes[-1]
-        prev_close = closes[-2]
-        move = (last_close - prev_close) / prev_close * 100
-        if move > 0.5 and last_close < last_open:
+        move = (closes[-1] - closes[-2]) / closes[-2] * 100
+        if move > 0.5 and closes[-1] < opens[-1]:
             return "SHORT", "Judas pump — bearish reversal candle"
-        if move < -0.5 and last_close > last_open:
+        if move < -0.5 and closes[-1] > opens[-1]:
             return "LONG", "Judas dump — bullish reversal candle"
         return None, None
     except:
@@ -190,55 +264,56 @@ def momentum_ok(oi):
 
 # ─── CONFIDENCE SCORE ────────────────────────
 
-def confidence_score(rsi, prev_rsi, ls, oi, signal, funding):
+def confidence_score(rsi, prev_rsi, ls, oi, signal, funding, bias_1h, bias_4h):
     score = 0
 
     if signal == "LONG":
-        if rsi < 40:           score += 2
-        if prev_rsi < rsi:     score += 1
-        if ls < 1.0:           score += 2
-        if funding < -0.0001:  score += 1
-        if rsi < 32:           score += 2
+        if rsi < 40:            score += 2
+        if prev_rsi < rsi:      score += 1
+        if ls < 1.0:            score += 2
+        if funding < -0.0001:   score += 1
+        if rsi < 32:            score += 2
+        if bias_1h == "BULL":   score += 1
+        if bias_4h == "BULL":   score += 2
 
     elif signal == "SHORT":
-        if rsi > 60:           score += 2
-        if prev_rsi > rsi:     score += 1
-        if ls > 1.5:           score += 2
-        if funding > 0.0001:   score += 1
-        if rsi > 68:           score += 2
+        if rsi > 60:            score += 2
+        if prev_rsi > rsi:      score += 1
+        if ls > 1.5:            score += 2
+        if funding > 0.0001:    score += 1
+        if rsi > 68:            score += 2
+        if bias_1h == "BEAR":   score += 1
+        if bias_4h == "BEAR":   score += 2
 
-    # Momentum tiers — OI size matters
-    if abs(oi) > 1.0:
-        score += 3
-    elif abs(oi) > 0.5:
-        score += 2
-    elif abs(oi) > 0.2:
-        score += 1
+    if abs(oi) > 1.0:    score += 3
+    elif abs(oi) > 0.5:  score += 2
+    elif abs(oi) > 0.2:  score += 1
 
-    # Liquidity sweep bonus — highest quality SMC setup
-    if signal != "NEUTRAL":
-        score += 2
+    if signal != "NEUTRAL": score += 1
 
     return min(score, 10)
 
 
 # ─── DYNAMIC SL/TP ───────────────────────────
-# wide=True  → 0.5% buffer, for Scout / wide window trades
-# wide=False → 0.2% buffer, for Sniper tight entries
 
-def dynamic_levels(signal, candles, price, wide=False):
+SL_BUFFERS = {
+    "5m":  0.002,   # 0.2% — sniper tight
+    "15m": 0.003,   # 0.3%
+    "1H":  0.010,   # 1.0% — swing room
+    "4H":  0.015,   # 1.5% — wider swing
+}
+
+def dynamic_levels(signal, candles, price, tf="5m"):
     try:
-        buf = 0.005 if wide else 0.002          # 0.5% vs 0.2%
+        buf   = SL_BUFFERS.get(tf, 0.002)
         highs = [float(c[2]) for c in candles[-10:]]
         lows  = [float(c[3]) for c in candles[-10:]]
-        recent_high = max(highs)
-        recent_low  = min(lows)
         if signal == "LONG":
-            sl = round(recent_low  * (1 - buf), 2)
-            tp = round(recent_high * (1 + buf), 2)
+            sl = round(min(lows)  * (1 - buf), 4)
+            tp = round(max(highs) * (1 + buf), 4)
         elif signal == "SHORT":
-            sl = round(recent_high * (1 + buf), 2)
-            tp = round(recent_low  * (1 - buf), 2)
+            sl = round(max(highs) * (1 + buf), 4)
+            tp = round(min(lows)  * (1 - buf), 4)
         else:
             return None, None, 0
         sl_dist = abs(price - sl)
@@ -249,12 +324,15 @@ def dynamic_levels(signal, candles, price, wide=False):
         return None, None, 0
 
 
-# ─── MASTER SIGNAL LOGIC ─────────────────────
+# ─── SIGNAL DETECTION ────────────────────────
 
-def apex_sniper(price, rsi, prev_rsi, funding, ls, oi, candles):
+def detect_signal(price, rsi, prev_rsi, funding, ls, oi, candles, tf):
     session_ok, session_name = session_filter()
-    if not session_ok:
+
+    # Swing TFs don't need session filter — they run all day
+    if tf in ["5m", "15m"] and not session_ok:
         return "NEUTRAL", f"Dead zone — {session_name}", session_name
+
     if not momentum_ok(oi):
         return "NEUTRAL", f"No momentum (OI {oi}%)", session_name
 
@@ -270,9 +348,9 @@ def apex_sniper(price, rsi, prev_rsi, funding, ls, oi, candles):
         return judas_sig, judas_reason, session_name
 
     if prev_rsi and prev_rsi < 30 and rsi > prev_rsi and ls > 1.5:
-        return "LONG",  "RSI reversal from oversold + long crowd", session_name
+        return "LONG",  "RSI reversal from oversold + crowd long", session_name
     if prev_rsi and prev_rsi > 70 and rsi < prev_rsi and ls < 0.7:
-        return "SHORT", "RSI reversal from overbought + short crowd", session_name
+        return "SHORT", "RSI reversal from overbought + crowd short", session_name
 
     return "NEUTRAL", "No SMC setup", session_name
 
@@ -287,172 +365,268 @@ def send_telegram(msg):
             timeout=10
         )
         if r.status_code == 200:
-            print("[✓] Telegram sent.")
+            print("  [✓] Telegram sent.")
         else:
-            print(f"[WARN] Telegram: {r.text}")
+            print(f"  [WARN] Telegram: {r.text}")
     except Exception as e:
-        print(f"[ERROR] Telegram: {e}")
+        print(f"  [ERROR] Telegram: {e}")
 
 
-# ─── MAIN CYCLE ──────────────────────────────
+# ─── ALERT BUILDER ───────────────────────────
 
-prev_rsi          = None
-last_alert_signal = None   # prevents spamming the same setup
-
-def run():
-    global prev_rsi, last_alert_signal
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    print(f"\n{'='*48}")
-    print(f"  APEX ELITE — {now}")
-    print(f"{'='*48}")
-
-    price        = get_price()
-    candles      = get_candles(bar="5m", limit=50)
-    rsi          = get_rsi()
-    funding      = get_funding()
-    ls           = get_ls()
-    oi           = get_oi()
-    fg, fg_label = get_fear_greed()
-
-    print(f"BTC: ${price:,.2f} | RSI: {rsi} | L/S: {ls} | OI: {oi}% | F&G: {fg}")
-
-    # First run — store RSI, stay silent
-    if prev_rsi is None:
-        prev_rsi = rsi
-        print("[i] First run — RSI stored. Monitoring...")
-        return
-
-    signal, reason, session = apex_sniper(price, rsi, prev_rsi, funding, ls, oi, candles)
-    score = confidence_score(rsi, prev_rsi, ls, oi, signal, funding)
-
-    print(f"Signal: {signal} | Score: {score}/10 | {reason}")
-
-    # Nothing actionable
-    if signal == "NEUTRAL" or score < 4:
-        last_alert_signal = None   # reset cooldown — market cleared
-        prev_rsi = rsi
-        return
+def build_message(tier, symbol, tf, signal, reason, session,
+                  price, tp, sl, rr, score, bar,
+                  prev_rsi, rsi, funding, ls, oi,
+                  fg, fg_label, bias_1h, bias_4h, now):
 
     direction = "📈" if signal == "LONG" else "📉"
-    bar       = "█" * score + "░" * (10 - score)
 
-    # ── TIER 1: SNIPER (6+) ──────────────────────────────────────────────
-    if score >= 6:
-        sl, tp, rr = dynamic_levels(signal, candles, price, wide=False)
-        if not sl or rr < 1.5:
-            print(f"[SKIP] Sniper RR {rr} too low")
-            prev_rsi = rsi
-            return
+    TIER_LABELS = {
+        "pre":    f"⚡ *PRE-ALERT — {symbol} {tf} {signal} FORMING*",
+        "scout":  f"🔍 *APEX SCOUT — {symbol} {tf} {signal}*",
+        "sniper": f"🎯 *APEX SNIPER — {symbol} {signal}*",
+        "swing1h":f"📊 *APEX SWING 1H — {symbol} {signal}*",
+        "swing4h":f"🏹 *APEX SWING 4H — {symbol} {signal}*",
+    }
 
-        # Avoid re-firing the exact same sniper direction
-        if last_alert_signal == f"SNIPER-{signal}":
-            print("[i] Sniper already alerted for this setup — skipping duplicate")
-            prev_rsi = rsi
-            return
+    header = TIER_LABELS.get(tier, f"📌 *APEX — {symbol} {signal}*")
 
-        msg = (
-            f"🎯 *APEX SNIPER — {signal}* `{now}`\n\n"
+    if tier == "pre":
+        return (
+            f"{header} `{now}`\n\n"
+            f"*Score:* {score}/10 — `{bar}`\n"
             f"*Reason:* {reason}\n"
-            f"*Session:* {session}\n\n"
-            f"*Entry:* ${price:,.2f}\n"
-            f"*TP:* ${tp:,}\n"
-            f"*SL:* ${sl:,}\n"
-            f"*R/R:* {rr}x {direction}\n\n"
-            f"*Confidence:* {score}/10\n"
-            f"`{bar}`\n\n"
-            f"*RSI:* {prev_rsi} → {rsi}\n"
-            f"*Funding:* {round(funding,5)}\n"
-            f"*L/S:* {ls} | *OI:* {oi}%\n"
-            f"*F&G:* {fg} — {fg_label}\n\n"
-            f"⚠️ _Smart Money Active — TIGHT ENTRY_"
+            f"*Session:* {session}\n"
+            f"*Bias:* 1H:{bias_1h} 4H:{bias_4h}\n"
+            f"*{symbol}:* ${price:,.4f}\n\n"
+            f"_Get chart ready — entry may fire next candle._"
         )
-        print(msg)
-        send_telegram(msg)
-        last_alert_signal = f"SNIPER-{signal}"
 
-    # ── TIER 2: SCOUT wide window (4–5) ──────────────────────────────────
-    elif 4 <= score <= 5:
-        sl, tp, rr = dynamic_levels(signal, candles, price, wide=True)
-        if not sl or rr < 1.2:
-            print(f"[SKIP] Scout RR {rr} too low")
+    hold_note = {
+        "scout":   "📐 _Wide window — larger SL, more room_",
+        "sniper":  "⚠️ _Smart Money Active — TIGHT ENTRY_",
+        "swing1h": "🕐 _Swing trade — set & walk away. Hold hours._",
+        "swing4h": "🗓 _Swing trade — set & walk away. Hold days._",
+    }.get(tier, "")
 
-            # Still send pre-alert if score is exactly 5 (sniper forming)
-            if score == 5 and last_alert_signal != f"PRE-{signal}":
-                pre_msg = (
-                    f"⚡ *PRE-ALERT — {signal} FORMING* `{now}`\n\n"
-                    f"*Score:* {score}/10 — `{bar}`\n"
-                    f"*Reason:* {reason}\n"
-                    f"*Session:* {session}\n"
-                    f"*BTC:* ${price:,.2f}\n\n"
-                    f"_RR not clean yet — get chart ready. Sniper may fire next candle._"
-                )
-                print(pre_msg)
-                send_telegram(pre_msg)
-                last_alert_signal = f"PRE-{signal}"
+    return (
+        f"{header} `{now}`\n\n"
+        f"*Reason:* {reason}\n"
+        f"*Session:* {session}\n"
+        f"*Bias:* 1H:{bias_1h} 4H:{bias_4h}\n\n"
+        f"*Entry:* ${price:,.4f}\n"
+        f"*TP:* ${tp:,}\n"
+        f"*SL:* ${sl:,}\n"
+        f"*R/R:* {rr}x {direction}\n\n"
+        f"*Confidence:* {score}/10\n"
+        f"`{bar}`\n\n"
+        f"*RSI:* {prev_rsi} → {rsi}\n"
+        f"*Funding:* {round(funding,6)}\n"
+        f"*L/S:* {ls} | *OI:* {oi}%\n"
+        f"*F&G:* {fg} — {fg_label}\n\n"
+        f"{hold_note}"
+    )
 
-            prev_rsi = rsi
+
+# ─── CORE SCAN FUNCTION ──────────────────────
+
+def scan_pair_tf(pair, tf, now, fg, fg_label):
+    symbol  = pair["symbol"]
+    inst    = pair["inst"]
+    ccy     = pair["ccy"]
+
+    # Candle limit — more history for higher TFs
+    limit   = 100 if tf in ["1H", "4H"] else 60
+    rsi_tf  = "15m" if tf == "5m" else tf
+
+    candles  = get_candles(inst, bar=tf,    limit=limit)
+    rsi_c    = get_candles(inst, bar=rsi_tf, limit=100)
+    price    = get_price(inst)
+    rsi      = get_rsi(rsi_c)
+    funding  = get_funding(inst)
+    ls       = get_ls(ccy)
+    oi       = get_oi(ccy)
+    bias_1h  = get_bias(inst, price, bar="1H")
+    bias_4h  = get_bias(inst, price, bar="4H")
+
+    prev_rsi = prev_rsi_map[symbol]
+    if prev_rsi is None:
+        prev_rsi_map[symbol] = rsi
+        print(f"  [{symbol}] First run — RSI stored.")
+        return
+
+    print(f"  {symbol}/{tf}: ${price:,.4f} | RSI:{rsi} | L/S:{ls} | OI:{oi}% | 1H:{bias_1h} 4H:{bias_4h}")
+
+    signal, reason, session = detect_signal(price, rsi, prev_rsi, funding, ls, oi, candles, tf)
+
+    # HTF gate
+    if signal != "NEUTRAL" and not bias_allows(signal, bias_1h, bias_4h):
+        print(f"  [{symbol}] BLOCKED — bias against {signal} (1H:{bias_1h} 4H:{bias_4h})")
+        prev_rsi_map[symbol] = rsi
+        return
+
+    score = confidence_score(rsi, prev_rsi, ls, oi, signal, funding, bias_1h, bias_4h)
+    print(f"  [{symbol}] {signal} | Score:{score}/10 | {reason}")
+
+    # Score thresholds by timeframe
+    min_score = 6 if tf in ["5m", "15m"] else 5
+
+    if signal == "NEUTRAL" or score < 4:
+        prev_rsi_map[symbol] = rsi
+        return
+
+    bar = "█" * score + "░" * (10 - score)
+
+    # ── SNIPER TIER (5m/15m, score 6+) ───────
+    if tf in ["5m", "15m"]:
+
+        if score == 5:
+            pre_id = f"PRE-{symbol}-{tf}-{signal}-{now[:13]}"
+            if not alert_exists(pre_id):
+                msg = build_message("pre", symbol, tf, signal, reason, session,
+                                    price, None, None, None, score, bar,
+                                    prev_rsi, rsi, funding, ls, oi,
+                                    fg, fg_label, bias_1h, bias_4h, now)
+                send_telegram(msg)
+                save_alert(pre_id, symbol, tf, signal, score)
+
+        elif score >= 6:
+            sl, tp, rr = dynamic_levels(signal, candles, price, tf="5m")
+            if not sl or rr < 1.5:
+                print(f"  [SKIP] Sniper RR {rr} too low")
+                prev_rsi_map[symbol] = rsi
+                return
+
+            sniper_id = f"SNIPER-{symbol}-{tf}-{signal}-{now[:13]}"
+            if alert_exists(sniper_id):
+                print(f"  [DUP] Sniper already sent")
+                prev_rsi_map[symbol] = rsi
+                return
+
+            msg = build_message("sniper", symbol, tf, signal, reason, session,
+                                 price, tp, sl, rr, score, bar,
+                                 prev_rsi, rsi, funding, ls, oi,
+                                 fg, fg_label, bias_1h, bias_4h, now)
+            send_telegram(msg)
+            save_alert(sniper_id, symbol, tf, signal, score)
+
+    # ── SWING TIER (1H/4H, score 5+) ─────────
+    elif tf in ["1H", "4H"]:
+
+        if score < min_score:
+            prev_rsi_map[symbol] = rsi
             return
 
-        # Avoid duplicate Scout alerts
-        if last_alert_signal == f"SCOUT-{signal}":
-            print("[i] Scout already alerted — skipping duplicate")
-            prev_rsi = rsi
-            return
+        tier   = "swing1h" if tf == "1H" else "swing4h"
+        rr_min = 1.5
 
-        # Score 5 = also send the pre-alert first
-        if score == 5 and last_alert_signal != f"PRE-{signal}":
-            pre_msg = (
-                f"⚡ *PRE-ALERT — {signal} FORMING* `{now}`\n\n"
-                f"*Score:* {score}/10 — `{bar}`\n"
-                f"*Reason:* {reason}\n"
-                f"*Session:* {session}\n"
-                f"*BTC:* ${price:,.2f}\n\n"
-                f"_Setup building — chart open, sniper may fire next candle._"
-            )
-            print(pre_msg)
-            send_telegram(pre_msg)
+        # Pre-alert for swing — fires one candle early
+        if score == 5:
+            pre_id = f"PRE-{symbol}-{tf}-{signal}-{now[:13]}"
+            if not alert_exists(pre_id):
+                msg = build_message("pre", symbol, tf, signal, reason, session,
+                                    price, None, None, None, score, bar,
+                                    prev_rsi, rsi, funding, ls, oi,
+                                    fg, fg_label, bias_1h, bias_4h, now)
+                send_telegram(msg)
+                save_alert(pre_id, symbol, tf, signal, score)
 
-        scout_msg = (
-            f"🔍 *APEX SCOUT — {signal}* `{now}`\n\n"
-            f"*Reason:* {reason}\n"
-            f"*Session:* {session}\n\n"
-            f"*Entry:* ${price:,.2f}\n"
-            f"*TP:* ${tp:,}\n"
-            f"*SL:* ${sl:,}\n"
-            f"*R/R:* {rr}x {direction}\n\n"
-            f"*Confidence:* {score}/10\n"
-            f"`{bar}`\n\n"
-            f"*RSI:* {prev_rsi} → {rsi}\n"
-            f"*Funding:* {round(funding,5)}\n"
-            f"*L/S:* {ls} | *OI:* {oi}%\n"
-            f"*F&G:* {fg} — {fg_label}\n\n"
-            f"📐 _Wide Window Entry — Larger SL, more room to breathe_"
-        )
-        print(scout_msg)
-        send_telegram(scout_msg)
-        last_alert_signal = f"SCOUT-{signal}"
+        elif score >= 6:
+            sl, tp, rr = dynamic_levels(signal, candles, price, tf=tf)
+            if not sl or rr < rr_min:
+                print(f"  [SKIP] Swing {tf} RR {rr} too low")
+                prev_rsi_map[symbol] = rsi
+                return
 
-    prev_rsi = rsi
+            swing_id = f"{tier.upper()}-{symbol}-{signal}-{now[:13]}"
+            if alert_exists(swing_id):
+                print(f"  [DUP] Swing already sent")
+                prev_rsi_map[symbol] = rsi
+                return
 
+            msg = build_message(tier, symbol, tf, signal, reason, session,
+                                 price, tp, sl, rr, score, bar,
+                                 prev_rsi, rsi, funding, ls, oi,
+                                 fg, fg_label, bias_1h, bias_4h, now)
+            send_telegram(msg)
+            save_alert(swing_id, symbol, tf, signal, score)
+
+    prev_rsi_map[symbol] = rsi
+
+
+# ─── SCHEDULED SCAN JOBS ─────────────────────
+
+def scan_sniper():
+    """5m candles — runs every 3 minutes."""
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    print(f"\n[SNIPER SCAN] {now}")
+    fg, fg_label = get_fear_greed()
+    for pair in PAIRS:
+        try:
+            scan_pair_tf(pair, "5m", now, fg, fg_label)
+        except Exception as e:
+            print(f"  [ERROR] {pair['symbol']} 5m: {e}")
+        time.sleep(2)
+
+
+def scan_swing_1h():
+    """1H candles — runs every 15 minutes."""
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    print(f"\n[SWING 1H SCAN] {now}")
+    fg, fg_label = get_fear_greed()
+    for pair in PAIRS:
+        try:
+            scan_pair_tf(pair, "1H", now, fg, fg_label)
+        except Exception as e:
+            print(f"  [ERROR] {pair['symbol']} 1H: {e}")
+        time.sleep(2)
+
+
+def scan_swing_4h():
+    """4H candles — runs every 60 minutes."""
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    print(f"\n[SWING 4H SCAN] {now}")
+    fg, fg_label = get_fear_greed()
+    for pair in PAIRS:
+        try:
+            scan_pair_tf(pair, "4H", now, fg, fg_label)
+        except Exception as e:
+            print(f"  [ERROR] {pair['symbol']} 4H: {e}")
+        time.sleep(2)
+
+
+def cleanup():
+    """Remove old alerts daily."""
+    clear_old_alerts()
+    print("[✓] Old alerts cleaned.")
+
+
+# ─── MAIN ────────────────────────────────────
 
 def main():
-    print("\n" + "█"*48)
-    print("  APEX ELITE — 3-TIER ALERT MODE")
-    print("  🔍 Scout (4-5) | ⚡ Pre-Alert (5) | 🎯 Sniper (6+)")
-    print("█"*48 + "\n")
+    print("\n" + "█"*50)
+    print("  APEX ELITE — MULTI-PAIR FINAL")
+    print("  Pairs : BTC | ETH | SOL | XRP | BNB")
+    print("  Tiers : 🎯 Sniper | 📊 Swing 1H | 🏹 Swing 4H")
+    print("  HTF   : EMA20 + EMA50 bias filter")
+    print("  Store : SQLite dedup")
+    print("█"*50 + "\n")
 
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         print("[ERROR] Missing TELEGRAM_TOKEN or TELEGRAM_CHAT_ID")
         return
 
-    run()
-    schedule.every(5).minutes.do(run)
-    print("[✓] Monitoring — every 5 minutes.\n")
+    init_db()
 
-    while True:
-        schedule.run_pending()
-        time.sleep(10)
+    # First pass — warm up RSI memory for all pairs
+    print("[i] Warming up — initial scan...\n")
+    fg, fg_label = get_fear_greed()
+    for pair in PAIRS:
+        try:
+            scan_pair_tf(pair, "5m", "warmup", fg, fg_label)
+        except Exception as e:
+            print(f"  [ERROR] warmup {pair['symbol']}: {e}")
+        time.sleep(2)
 
-
-if __name__ == "__main__":
-    main()
+    # Schedule all three scan tiers
+    schedule.
